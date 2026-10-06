@@ -1,0 +1,7 @@
+# Local optional bridge dependencies; not needed by native core.
+sounddevice>=0.5,<1
+soundfile>=0.13,<1
+numpy>=1.26,<3
+torch>=2.5,<3
+silero-vad>=6,<7
+kokoro>=0.9,<1
