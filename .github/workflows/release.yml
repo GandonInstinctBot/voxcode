@@ -65,6 +65,8 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/*
   publish:
+    permissions:
+      contents: write
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
@@ -77,6 +79,9 @@ jobs:
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v${{ needs.version.outputs.version }}" dist/* \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "v${{ needs.version.outputs.version }}" --generate-notes
+          tag="v${{ needs.version.outputs.version }}"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
