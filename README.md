@@ -109,3 +109,10 @@ No complete zero-setup desktop installer, wake word, speech echo cancellation,
 worker sandbox, autonomous git merge/push, fine-tuned System 1 classifier,
 provider billing reconciliation, graph edge resolution, or embedded speech
 runtime. These are gaps, not completed features. See ACCEPTANCE.md.
+
+Release acceptance (2026-10-05): v0.1.22 passed native tests and executable
+smoke checks on all five CI runners. Linux x64 archive checksum independently
+verified, then released CLI version/doctor/update-check ran successfully.
+The CI GNU/Linux binary may warn about GLIBC_2.39 on older distributions;
+compatibility on older distros is not claimed. Hardened self-replacement is
+being checked against the next release; real speech/hardware checks remain open.
