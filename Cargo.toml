@@ -9,6 +9,15 @@ license = "MIT"
 self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "0.10"
+tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tiny_http = "0.12"
+walkdir = "2"
+regex = "1"
 
 [profile.release]
 opt-level = "z"
@@ -16,3 +25,7 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[[bin]]
+name = "harness"
+path = "voice-spike.rs"
