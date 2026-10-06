@@ -1,3 +1,50 @@
+mod dashboard {
+use anyhow::Result;
+use serde_json::json;
+use std::path::Path;
+pub fn serve(home: &Path, port: u16) -> Result<()> {
+    let server =
+        tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Dashboard: http://127.0.0.1:{port} (local only)");
+    for req in server.incoming_requests() {
+        let url = req.url().to_owned();
+        let method = req.method().as_str();
+        let result = (|| -> Result<(String, &str, u16)> {
+            if method != "GET" {
+                return Ok(("read-only dashboard".into(), "text/plain", 405));
+            }
+            if url == "/" {
+                return Ok((include_str!("dashboard.html").into(), "text/html", 200));
+            }
+            if url == "/api/state" {
+                let projects = crate::project::list(home)?;
+                let c = crate::project::db(home)?;
+                let mut q =
+                    c.prepare("SELECT project,kind,body,ts FROM events ORDER BY id DESC LIMIT 50")?;
+                let events=q.query_map([],|r|Ok(json!({"project":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,"body":r.get::<_,String>(2)?,"ts":r.get::<_,String>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let maps = projects
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.name.clone(),
+                            crate::project::map(Path::new(&p.path)).unwrap_or_default(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                return Ok((json!({"version":env!("CARGO_PKG_VERSION"),"projects":projects,"events":events,"architectures":maps}).to_string(),"application/json",200));
+            }
+            Ok(("Not found".into(), "text/plain", 404))
+        })();
+        let (body, mime, code) = result
+            .unwrap_or_else(|_| ("Cannot read local project state".into(), "text/plain", 500));
+        let mut response = tiny_http::Response::from_string(body).with_status_code(code);
+        for (k,v) in [("Content-Type",mime),("X-Content-Type-Options","nosniff"),("Cache-Control","no-store"),("Content-Security-Policy","default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")]{response.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
+        let _ = req.respond(response);
+    }
+    Ok(())
+}
+
+}
 mod project {
 use anyhow::{bail,Result};use serde::Serialize;use rusqlite::{Connection,params};use std::path::{Path,PathBuf};
 pub fn db(home:&Path)->Result<Connection>{std::fs::create_dir_all(home)?;let c=Connection::open(home.join("projects.sqlite"))?;c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS projects(name TEXT PRIMARY KEY,path TEXT NOT NULL,cloud INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,project TEXT,kind TEXT,body TEXT,ts TEXT DEFAULT CURRENT_TIMESTAMP); CREATE VIRTUAL TABLE IF NOT EXISTS memory USING fts5(project,body); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);")?;Ok(c)}
@@ -123,6 +170,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    Serve { home:std::path::PathBuf, #[arg(long,default_value_t=8484)] port:u16 },
     /// Register a local code project, cloud disabled by default
     Add { home:std::path::PathBuf, name:String, repo:std::path::PathBuf },
     /// List project registry and privacy settings
@@ -168,6 +216,7 @@ fn updater() -> Result<Box<dyn self_update::update::ReleaseUpdate>> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Some(Cmd::Serve{home,port})=>dashboard::serve(&home,port)?,
         Some(Cmd::Add{home,name,repo})=>project::add(&home,&name,&repo)?,
         Some(Cmd::Projects{home})=>println!("{}",serde_json::to_string_pretty(&project::list(&home)?)?),
         Some(Cmd::Map{repo})=>println!("{}",serde_json::to_string_pretty(&project::map(&repo)?)?),
@@ -202,4 +251,4 @@ fn main() -> Result<()> {
         None => println!("harness {} (voice UI and dashboard not built yet)", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
-}
+                                                                                                                                                              }
