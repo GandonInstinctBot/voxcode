@@ -1,3 +1,23 @@
+mod project {
+use anyhow::{bail,Result};use serde::Serialize;use rusqlite::{Connection,params};use std::path::{Path,PathBuf};
+pub fn db(home:&Path)->Result<Connection>{std::fs::create_dir_all(home)?;let c=Connection::open(home.join("projects.sqlite"))?;c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS projects(name TEXT PRIMARY KEY,path TEXT NOT NULL,cloud INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,project TEXT,kind TEXT,body TEXT,ts TEXT DEFAULT CURRENT_TIMESTAMP); CREATE VIRTUAL TABLE IF NOT EXISTS memory USING fts5(project,body); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);")?;Ok(c)}
+pub fn add(home:&Path,name:&str,path:&Path)->Result<()>{if name.is_empty()||name.len()>80{bail!("invalid project name")};let path=path.canonicalize()?;crate::worker::git(&path,&["rev-parse","--show-toplevel"])?;db(home)?.execute("INSERT INTO projects(name,path) VALUES(?1,?2)",params![name,path.to_string_lossy()])?;Ok(())}
+#[derive(Serialize)]pub struct Project{pub name:String,pub path:String,pub cloud:bool}
+pub fn list(home:&Path)->Result<Vec<Project>>{let c=db(home)?;let mut q=c.prepare("SELECT name,path,cloud FROM projects ORDER BY name")?;let rows=q.query_map([],|r|Ok(Project{name:r.get(0)?,path:r.get(1)?,cloud:r.get(2)?}))?;Ok(rows.collect::<rusqlite::Result<_>>()?)}
+pub fn path(home:&Path,name:&str)->Result<PathBuf>{Ok(PathBuf::from(db(home)?.query_row("SELECT path FROM projects WHERE name=?1",[name],|r|r.get::<_,String>(0))?))}
+pub fn event(home:&Path,name:&str,kind:&str,body:&str)->Result<()>{db(home)?.execute("INSERT INTO events(project,kind,body) VALUES(?1,?2,?3)",params![name,kind,body])?;Ok(())}
+pub fn remember(home:&Path,name:&str,body:&str)->Result<()>{db(home)?.execute("INSERT INTO memory(project,body) VALUES(?1,?2)",params![name,body])?;Ok(())}
+pub fn recall(home:&Path,name:&str,term:&str)->Result<Vec<String>>{let c=db(home)?;let mut q=c.prepare("SELECT body FROM memory WHERE project=?1 AND memory MATCH ?2 ORDER BY rank LIMIT 8")?;let rows=q.query_map(params![name,term],|r|r.get(0))?;Ok(rows.collect::<rusqlite::Result<_>>()?)}
+#[derive(Serialize)]pub struct Module{pub path:String,pub symbols:Vec<String>,pub imports:Vec<String>}
+fn parse_symbols(code:&str,ext:&str)->Result<Vec<String>>{
+ let mut parser=tree_sitter::Parser::new();let lang=match ext{"rs"=>Some(tree_sitter_rust::LANGUAGE),"py"=>Some(tree_sitter_python::LANGUAGE),"js"=>Some(tree_sitter_javascript::LANGUAGE),_=>None};
+ let Some(lang)=lang else{return Ok(vec![])};parser.set_language(&lang.into())?;
+ let tree=parser.parse(code,None).ok_or_else(||anyhow::anyhow!("parse failed"))?;let mut symbols=vec![];let mut stack=vec![tree.root_node()];while let Some(n)=stack.pop(){if matches!(n.kind(),"function_item"|"struct_item"|"enum_item"|"trait_item"|"function_definition"|"class_definition"|"function_declaration"|"class_declaration"){if let Some(name)=n.child_by_field_name("name"){symbols.push(name.utf8_text(code.as_bytes())?.to_owned())}}let mut cursor=n.walk();stack.extend(n.children(&mut cursor));if symbols.len()>=100{break}}Ok(symbols)
+}
+pub fn map(root:&Path)->Result<Vec<Module>>{let re=regex::Regex::new(r"^\s*(?:(?:pub|export|async|private|public|static)\s+)*(?:fn|def|class|struct|enum|interface|function)\s+([A-Za-z_][A-Za-z_0-9]*)")?;let mut out=vec![];for e in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e|!matches!(e.file_name().to_str(),Some(".git"|"target"|"node_modules"|".voxcode"|".venv"))).take(5000){let e=e?;if !e.file_type().is_file(){continue};let p=e.path();if !matches!(p.extension().and_then(|s|s.to_str()),Some("rs"|"py"|"js"|"ts"|"tsx"|"lua"|"go")){continue};if e.metadata()?.len()>256000{continue};let s=std::fs::read_to_string(p)?;let mut symbols:Vec<String>=s.lines().filter_map(|l|re.captures(l).map(|m|m[1].to_string())).take(100).collect();let parsed=parse_symbols(&s,p.extension().and_then(|x|x.to_str()).unwrap_or(""))?;if !parsed.is_empty(){symbols=parsed}let imports=s.lines().filter(|l|{let l=l.trim();l.starts_with("use ")||l.starts_with("import ")||l.starts_with("from ")||l.starts_with("mod ")||l.contains("require(")}).take(60).map(str::to_string).collect();out.push(Module{path:p.strip_prefix(root)?.to_string_lossy().into_owned(),symbols,imports});}Ok(out)}
+#[cfg(test)]mod tests{use super::*;#[test]fn memory_roundtrip(){let d=tempfile::tempdir().unwrap();remember(d.path(),"demo","Use Rust and small modules").unwrap();assert_eq!(recall(d.path(),"demo","Rust").unwrap().len(),1);assert!(recall(d.path(),"other","Rust").unwrap().is_empty());}}
+
+}
 mod worker {
 use anyhow::{bail,Context,Result};
 use serde::{Serialize,Deserialize};
@@ -103,6 +123,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Register a local code project, cloud disabled by default
+    Add { home:std::path::PathBuf, name:String, repo:std::path::PathBuf },
+    /// List project registry and privacy settings
+    Projects { home:std::path::PathBuf },
+    /// Index modules, symbols and imports (bounded fallback parser)
+    Map { repo:std::path::PathBuf },
+    Remember { home:std::path::PathBuf, project:String, body:String },
+    Recall { home:std::path::PathBuf, project:String, query:String },
     /// Ask one worker for a reviewable patch in an isolated worktree
     Work { config:std::path::PathBuf, repo:std::path::PathBuf, task:String },
     /// Run an explicit trusted test program in a repository (not a security sandbox)
@@ -140,6 +168,11 @@ fn updater() -> Result<Box<dyn self_update::update::ReleaseUpdate>> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Some(Cmd::Add{home,name,repo})=>project::add(&home,&name,&repo)?,
+        Some(Cmd::Projects{home})=>println!("{}",serde_json::to_string_pretty(&project::list(&home)?)?),
+        Some(Cmd::Map{repo})=>println!("{}",serde_json::to_string_pretty(&project::map(&repo)?)?),
+        Some(Cmd::Remember{home,project,body})=>project::remember(&home,&project,&body)?,
+        Some(Cmd::Recall{home,project,query})=>println!("{}",serde_json::to_string_pretty(&project::recall(&home,&project,&query)?)?),
         Some(Cmd::Work{config,repo,task})=>{let v:serde_json::Value=serde_json::from_slice(&std::fs::read(config)?)?;let g=serde_json::from_value(v["gateway"].clone())?;println!("{}",worker::run(&repo,&task,&g)?);}
         Some(Cmd::Test{repo,program,args})=>{let st=std::process::Command::new(program).args(args).current_dir(repo).status()?;if !st.success(){anyhow::bail!("tests failed: {st}")}},
         Some(Cmd::Init{path})=>{if path.exists(){anyhow::bail!("config already exists")}
