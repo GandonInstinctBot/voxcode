@@ -43,6 +43,11 @@ jobs:
         run: sed -i.bak '0,/^version = .*/s//version = "${{ needs.version.outputs.version }}"/' Cargo.toml
       - run: cargo test --release --target ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
+      - name: smoke check
+        shell: bash
+        run: |
+          target/${{ matrix.target }}/release/harness --version
+          target/${{ matrix.target }}/release/harness doctor
       - name: package
         shell: bash
         run: |
@@ -50,9 +55,10 @@ jobs:
           mkdir dist
           if [ "${{ matrix.ext }}" = zip ]; then
             cp target/${{ matrix.target }}/release/harness.exe .
-            7z a "dist/$name.zip" harness.exe
+            7z a "dist/$name.zip" harness.exe speech.py requirements-voice.txt README.md ACCEPTANCE.md benchmark.py
           else
-            tar -C target/${{ matrix.target }}/release -czf "dist/$name.tar.gz" harness
+            cp target/${{ matrix.target }}/release/harness .
+            tar -czf "dist/$name.tar.gz" harness speech.py requirements-voice.txt README.md ACCEPTANCE.md benchmark.py
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -66,6 +72,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
