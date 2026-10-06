@@ -626,6 +626,7 @@ mod tests {
         assert!(reserve(d.path(), "demo", &b, 1000, 1000).is_err());
     }
 }
+#[cfg(test)]mod reserve_tests{use super::*;#[test]fn reservations_accumulate(){let d=tempfile::tempdir().unwrap();let b=Budget{cap_usd:0.001,max_call_usd:0.001,input_per_million:1.,output_per_million:1.};assert!(reserve(d.path(),"demo",&b,400,100).is_ok());assert!(reserve(d.path(),"demo",&b,400,100).is_ok());assert!(reserve(d.path(),"demo",&b,400,100).is_err());assert!(reserve(d.path(),"other",&b,400,100).is_ok());}#[test]fn nan_prices_denied(){let d=tempfile::tempdir().unwrap();let b=Budget{cap_usd:1.,max_call_usd:1.,input_per_million:f64::NAN,output_per_million:1.};assert!(reserve(d.path(),"demo",&b,1,1).is_err());}}
 
 }
 mod update {
@@ -879,6 +880,7 @@ mod tests {
         .is_err());
     }
 }
+#[cfg(test)]mod config_tests{use super::*;#[test]fn adapters_roundtrip(){let cfg=VoiceConfig{capture:Adapter{program:"capture".into(),args:vec!["{audio}".into()]},transcribe:Adapter{program:"stt".into(),args:vec!["{audio}".into(),"{text}".into()]},speak:Adapter{program:"tts".into(),args:vec!["{reply}".into()]},timeout_seconds:1};let text=serde_json::to_string(&cfg).unwrap();let decoded:VoiceConfig=serde_json::from_str(&text).unwrap();assert_eq!(decoded.transcribe.args.len(),2);}}
 
 }
 mod worker {
@@ -1232,4 +1234,4 @@ fn main() -> Result<()> {
         None => println!("harness {} (voice UI and dashboard not built yet)", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
-                }
+        }
