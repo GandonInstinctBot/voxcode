@@ -9,12 +9,58 @@ pub fn serve(home: &Path, port: u16) -> Result<()> {
     for req in server.incoming_requests() {
         let url = req.url().to_owned();
         let method = req.method().as_str();
+        let host = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Host"))
+            .map(|h| h.value.as_str())
+            .unwrap_or("");
+        let expected = format!("127.0.0.1:{port}");
+        if host != expected {
+            let _ =
+                req.respond(tiny_http::Response::from_string("invalid host").with_status_code(403));
+            continue;
+        }
+        let origin = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Origin"))
+            .map(|h| h.value.as_str())
+            .unwrap_or("");
+        let token = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("X-Voxcode-Confirm"))
+            .map(|h| h.value.as_str())
+            .unwrap_or("");
+        if method == "POST" && url == "/api/update/install" {
+            if origin != format!("http://{expected}") || token != "install-verified-release" {
+                let _ = req.respond(
+                    tiny_http::Response::from_string("confirmation required").with_status_code(403),
+                );
+                continue;
+            }
+            let result = crate::update::install();
+            let (body, code) = match result {
+                Ok(s) => (s, 200),
+                Err(e) => (e.to_string(), 400),
+            };
+            let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(code));
+            continue;
+        }
         let result = (|| -> Result<(String, &str, u16)> {
             if method != "GET" {
                 return Ok(("read-only dashboard".into(), "text/plain", 405));
             }
             if url == "/" {
                 return Ok((include_str!("dashboard.html").into(), "text/html", 200));
+            }
+            if url == "/api/update/check" {
+                return Ok((
+                    crate::update::latest()?.to_string(),
+                    "application/json",
+                    200,
+                ));
             }
             if url == "/api/state" {
                 let projects = crate::project::list(home)?;
@@ -582,6 +628,130 @@ mod tests {
 }
 
 }
+mod update {
+use anyhow::{bail, Context, Result};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{path::Path, time::Duration};
+fn client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .user_agent("voxcode-updater")
+        .timeout(Duration::from_secs(120))
+        .build()?)
+}
+pub fn latest() -> Result<Value> {
+    Ok(client()?
+        .get(format!(
+            "https://api.github.com/repos/{}/{}/releases/latest",
+            crate::OWNER,
+            crate::REPO
+        ))
+        .send()?
+        .error_for_status()?
+        .json()?)
+}
+pub fn verify(bytes: &[u8], manifest: &str, name: &str) -> Result<()> {
+    let expected = manifest
+        .lines()
+        .find_map(|l| {
+            let mut p = l.split_whitespace();
+            let hash = p.next()?;
+            let file = p.next()?.trim_start_matches('*');
+            (file == name).then_some(hash)
+        })
+        .context("archive checksum absent")?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if expected != actual {
+        bail!("checksum mismatch; update refused")
+    };
+    Ok(())
+}
+pub fn install() -> Result<String> {
+    let release = latest()?;
+    let tag = release["tag_name"].as_str().context("missing tag")?;
+    if !self_update::version::bump_is_greater(
+        env!("CARGO_PKG_VERSION"),
+        tag.trim_start_matches('v'),
+    )? {
+        return Ok("Already up to date".into());
+    }
+    let target = self_update::get_target();
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let name = format!("harness-{tag}-{target}.{ext}");
+    let assets = release["assets"].as_array().context("missing assets")?;
+    let asset = assets
+        .iter()
+        .find(|a| a["name"] == name)
+        .context("platform archive absent")?;
+    let manifest = assets
+        .iter()
+        .find(|a| a["name"] == "SHA256SUMS")
+        .context("unsigned legacy release has no checksum manifest; refusing install")?;
+    let http = client()?;
+    let archive = http
+        .get(
+            asset["browser_download_url"]
+                .as_str()
+                .context("archive URL")?,
+        )
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    if archive.len() > 100_000_000 {
+        bail!("archive too large")
+    };
+    let sums = http
+        .get(
+            manifest["browser_download_url"]
+                .as_str()
+                .context("manifest URL")?,
+        )
+        .send()?
+        .error_for_status()?
+        .text()?;
+    verify(&archive, &sums, &name)?;
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join(&name);
+    std::fs::write(&path, &archive)?;
+    let bin = if cfg!(windows) {
+        "harness.exe"
+    } else {
+        "harness"
+    };
+    self_update::Extract::from_source(&path).extract_file(temp.path(), bin)?;
+    let executable = temp.path().join(bin);
+    if !Path::new(&executable).is_file() {
+        bail!("executable absent")
+    };
+    self_replace::self_replace(&executable)?;
+    Ok(format!("Updated to {tag}. Restart the app."))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_tamper() {
+        let good = format!("{:x}  test.tar.gz", Sha256::digest(b"good"));
+        assert!(verify(b"good", &good, "test.tar.gz").is_ok());
+        assert!(verify(b"bad", &good, "test.tar.gz").is_err());
+        assert!(verify(b"good", &good, "other").is_err());
+    }
+}
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+    #[test]
+    fn verify_before_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.tar.gz");
+        let bytes = b"not a valid archive";
+        std::fs::write(&path, bytes).unwrap();
+        assert!(verify(bytes, "00 bad.tar.gz", "bad.tar.gz").is_err());
+        assert!(!dir.path().join("harness").exists());
+    }
+}
+
+}
 mod voice {
 // Local speech adapters. No shell is used; each stage receives explicit arguments.
 use anyhow::{bail, Context, Result};
@@ -914,6 +1084,12 @@ enum Cmd {
         #[arg(long)]
         escalate: bool,
     },
+    /// Concurrent independent workers, each returns an unmerged patch
+    Parallel {
+        config: std::path::PathBuf,
+        repo: std::path::PathBuf,
+        tasks: Vec<String>,
+    },
     /// Serve local read-only project dashboard
     Serve {
         home: std::path::PathBuf,
@@ -1021,6 +1197,7 @@ fn main() -> Result<()> {
             }
         },
         Some(Cmd::Route{request,escalate})=>println!("{}",serde_json::to_string_pretty(&router::route(&request,escalate))?),
+        Some(Cmd::Parallel{config,repo,tasks})=>{if tasks.is_empty()||tasks.len()>4{anyhow::bail!("give 1 to 4 tasks")};let v:serde_json::Value=serde_json::from_slice(&std::fs::read(config)?)?;let g:gateway::Gateway=serde_json::from_value(v["gateway"].clone())?;let handles:Vec<_>=tasks.into_iter().map(|task|{let repo=repo.clone();let g=g.clone();std::thread::spawn(move||worker::run(&repo,&task,&g))}).collect();for h in handles{match h.join(){Ok(Ok(s))=>println!("{s}"),Ok(Err(e))=>eprintln!("worker failed: {e}"),Err(_)=>anyhow::bail!("worker panicked")}}},
         Some(Cmd::Serve{home,port})=>dashboard::serve(&home,port)?,
         Some(Cmd::Add{home,name,repo})=>project::add(&home,&name,&repo)?,
         Some(Cmd::Projects{home})=>println!("{}",serde_json::to_string_pretty(&project::list(&home)?)?),
@@ -1049,10 +1226,10 @@ fn main() -> Result<()> {
             }
             println!("update available: {cur} -> {}", latest.version);
             if !check {
-                let st=u.update()?;println!("updated to {}",st.version());
+                println!("{}",update::install()?);
             }
         }
         None => println!("harness {} (voice UI and dashboard not built yet)", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
-        }
+                }
