@@ -7,3 +7,5 @@ Local-first voice agent harness for code projects. Early scaffold: self-update w
     harness update          # download and replace the running binary
 
 Every push to main builds Linux, macOS and Windows binaries and publishes a release.
+
+Self-update: run `harness update` to install the newest GitHub release.
